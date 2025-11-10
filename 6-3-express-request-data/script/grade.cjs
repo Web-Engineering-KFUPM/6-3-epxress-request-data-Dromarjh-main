@@ -1,144 +1,176 @@
 /* eslint-disable no-console */
 /**
- * Flexible autograder for 6-3 Express Request Data lab
- * Scoring:
+ * Resilient autograder for 6-3 Express Request Data
  * - Total 100 = 80 (lab TODOs) + 20 (submission timing)
- * - Each TODO = 16 points: 8 completeness, 4 correctness, 4 quality
- * - Late submission (after 2025-11-12 23:59:59 +03:00 Riyadh) = 10/20; on time = 20/20
- * - If the student implements some tasks (partial progress), floor lab score at 60/80 (but not for zero work)
- * - Checks are intentionally flexible and top-level; no strict code structure requirements
+ * - Each TODO = 16 (8 completeness, 4 correctness, 4 quality)
+ * - On-time = 20/20, Late (after Riyadh 2025-11-12 23:59:59 +03:00) = 10/20
+ * - If some progress but lab_points < 60, floor to 60/80
+ * - Flexible, top-level checks only; no strict code structure
  *
- * Output:
- * - Writes artifacts to dist/grading/
- *   - grade.json (structured scores and feedback)
- *   - grade.txt (human-readable summary)
+ * Artifacts:
+ *   dist/grading/grade.json
+ *   dist/grading/grade.txt
+ *
+ * Also writes the pretty summary to GitHub Actions job summary.
  */
 
 const fs = require("fs");
 const path = require("path");
 const { spawn } = require("child_process");
 
-// -------------------- Config --------------------
-const DUE_STR = "2025-11-12T23:59:59+03:00"; // Riyadh time
-const DEADLINE = new Date(DUE_STR).getTime(); // convert to ms
-const ROOT = process.cwd();
-const OUT_DIR = path.join(ROOT, "dist", "grading");
-fs.mkdirSync(OUT_DIR, { recursive: true });
+const DUE_STR = "2025-11-12T23:59:59+03:00";
+const DEADLINE = new Date(DUE_STR).getTime();
 
-// candidate entry files (flexible)
-const ENTRY_CANDIDATES = [
-  "app.js",
-  "server.js",
-  "index.js",
-  "main.js",
-  "src/app.js",
-  "src/server.js",
-  "src/index.js",
-];
-
-// candidate ports to probe (do not require 3000)
-const PORTS = Array.from({ length: 20 }, (_, i) => 3000 + i); // 3000..3019
-
-// request helpers
-const FETCH_OPTS = { method: "GET" };
-const REQ_TIMEOUT_MS = 4000;
+const REQ_TIMEOUT_MS = 3500;
 const STARTUP_TIMEOUT_MS = 12000;
+const SCAN_PORTS = Array.from({ length: 24 }, (_, i) => 3000 + i); // 3000..3023
 
-function timeout(ms) {
-  return new Promise((res) => setTimeout(res, ms));
-}
+// --------------------- helpers ---------------------
+function nowUtcIso() { return new Date().toISOString(); }
+function isLate() { return Date.now() > DEADLINE; }
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-async function safeFetch(url, opts = {}, timeoutMs = REQ_TIMEOUT_MS) {
+async function safeFetch(url, opts = {}, to = REQ_TIMEOUT_MS) {
   const controller = new AbortController();
-  const id = setTimeout(() => controller.abort(), timeoutMs);
+  const t = setTimeout(() => controller.abort(), to);
   try {
     const res = await fetch(url, { ...opts, signal: controller.signal });
     return res;
-  } catch (e) {
+  } catch {
     return null;
   } finally {
-    clearTimeout(id);
+    clearTimeout(t);
   }
 }
 
-function nowUtcIso() {
-  return new Date().toISOString();
+function ensureOutDir(root) {
+  const out = path.join(root, "dist", "grading");
+  fs.mkdirSync(out, { recursive: true });
+  return out;
 }
 
-function isLate() {
-  const now = Date.now();
-  return now > DEADLINE;
+function makeTodoScore() {
+  return { completeness: 0, correctness: 0, quality: 0, notes: [] };
+}
+function clamp(n, a, b) { return Math.max(a, Math.min(b, n)); }
+function bandPoints(s) {
+  return clamp(s.completeness, 0, 8) + clamp(s.correctness, 0, 4) + clamp(s.quality, 0, 4);
 }
 
-// Attempt to start the student app
+function pushOK(arr, msg) { arr.push(`✅ ${msg}`); }
+function pushWARN(arr, msg) { arr.push(`⚠️ ${msg}`); }
+function pushX(arr, msg) { arr.push(`❌ ${msg}`); }
+
+// --------------------- detect lab dir ---------------------
+const REPO_ROOT = process.cwd();
+let LAB_DIR = REPO_ROOT;
+
+// If server.js not in root, try known subfolder
+const ROOT_HAS_SERVER = fs.existsSync(path.join(REPO_ROOT, "server.js"));
+const SUB_LAB = path.join(REPO_ROOT, "6-3-express-request-data");
+const SUB_HAS_SERVER = fs.existsSync(path.join(SUB_LAB, "server.js"));
+if (!ROOT_HAS_SERVER && SUB_HAS_SERVER) {
+  LAB_DIR = SUB_LAB;
+  process.chdir(LAB_DIR);
+} else if (ROOT_HAS_SERVER) {
+  LAB_DIR = REPO_ROOT;
+} else if (fs.existsSync(SUB_LAB)) {
+  // Fall back anyway if the folder exists (server may be named differently)
+  LAB_DIR = SUB_LAB;
+  process.chdir(LAB_DIR);
+}
+
+// For artifacts
+const OUT_DIR = ensureOutDir(LAB_DIR);
+
+// --------------------- start student app ---------------------
+const ENTRY_CANDIDATES = [
+  "server.js",
+  "app.js",
+  "index.js",
+  "main.js",
+  "src/server.js",
+  "src/app.js",
+  "src/index.js",
+];
+
 async function startStudentApp() {
-  // Prefer explicit entry file if exists, else npm start
-  let entry = ENTRY_CANDIDATES.find((p) => fs.existsSync(path.join(ROOT, p)));
-  let child;
+  let entry = ENTRY_CANDIDATES.find(p => fs.existsSync(path.join(LAB_DIR, p)));
   let usedCommand = "";
+  let child;
+
+  const pkgPath = path.join(LAB_DIR, "package.json");
+  const hasPkg = fs.existsSync(pkgPath);
+  const hasStart = hasPkg && (() => {
+    try {
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
+      return pkg.scripts && pkg.scripts.start;
+    } catch { return false; }
+  })();
 
   if (entry) {
     usedCommand = `node ${entry}`;
-    child = spawn(process.execPath, [path.join(ROOT, entry)], {
-      cwd: ROOT,
+    child = spawn(process.execPath, [path.join(LAB_DIR, entry)], {
+      cwd: LAB_DIR,
+      env: { ...process.env },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } else if (hasStart) {
+    usedCommand = "npm start";
+    child = spawn(/^win/.test(process.platform) ? "npm.cmd" : "npm", ["start"], {
+      cwd: LAB_DIR,
       env: { ...process.env },
       stdio: ["ignore", "pipe", "pipe"],
     });
   } else {
-    // try npm start
-    usedCommand = "npm start";
-    child = spawn(/^win/.test(process.platform) ? "npm.cmd" : "npm", ["start"], {
-      cwd: ROOT,
-      env: { ...process.env },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    // Last resort: try server.js anyway
+    if (fs.existsSync(path.join(LAB_DIR, "server.js"))) {
+      usedCommand = "node server.js";
+      child = spawn(process.execPath, [path.join(LAB_DIR, "server.js")], {
+        cwd: LAB_DIR,
+        env: { ...process.env },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } else {
+      usedCommand = "(no entry found)";
+      return { child: null, stdoutBuf: "", stderrBuf: "No entry file or npm start.", detectedPort: null, usedCommand };
+    }
   }
 
   let stdoutBuf = "";
   let stderrBuf = "";
+  child.stdout.on("data", d => stdoutBuf += d.toString());
+  child.stderr.on("data", d => stderrBuf += d.toString());
 
-  child.stdout.on("data", (d) => (stdoutBuf += d.toString()));
-  child.stderr.on("data", (d) => (stderrBuf += d.toString()));
-
-  // Try to detect port from logs like "http://localhost:3001" or "listening on 3002"
   let detectedPort = null;
   const portRegexes = [
     /http:\/\/(?:localhost|127\.0\.0\.1):(\d{2,5})/i,
     /listening(?:\s+on)?\s+port\s+(\d{2,5})/i,
-    /PORT(?:=|:)\s*(\d{2,5})/i,
+    /\bPORT(?:=|:)\s*(\d{2,5})\b/i,
   ];
 
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < STARTUP_TIMEOUT_MS && child.exitCode === null) {
-    // try to parse a port from logs
+  const start = Date.now();
+  while (Date.now() - start < STARTUP_TIMEOUT_MS && child.exitCode === null) {
     const logs = stdoutBuf + "\n" + stderrBuf;
-    for (const rgx of portRegexes) {
-      const m = logs.match(rgx);
-      if (m && m[1]) {
-        detectedPort = Number(m[1]);
-        break;
-      }
+    for (const rx of portRegexes) {
+      const m = logs.match(rx);
+      if (m && m[1]) { detectedPort = Number(m[1]); break; }
     }
     if (detectedPort) break;
-    await timeout(300);
+    await sleep(250);
   }
 
   return { child, stdoutBuf, stderrBuf, detectedPort, usedCommand };
 }
 
-async function probePorts() {
-  // If a port is detected from logs, we try that first; else scan defaults
-  return PORTS;
-}
-
-async function findWorkingBaseUrl(detectedPort = null) {
+async function findBaseUrl(detectedPort = null) {
   const candidates = [];
   if (detectedPort) candidates.push(detectedPort);
-  for (const p of PORTS) if (!candidates.includes(p)) candidates.push(p);
+  for (const p of SCAN_PORTS) if (!candidates.includes(p)) candidates.push(p);
 
   for (const p of candidates) {
     const url = `http://127.0.0.1:${p}/`;
-    const res = await safeFetch(url, FETCH_OPTS);
+    const res = await safeFetch(url);
     if (res && (res.ok || res.status === 404)) {
       return `http://127.0.0.1:${p}`;
     }
@@ -146,353 +178,296 @@ async function findWorkingBaseUrl(detectedPort = null) {
   return null;
 }
 
-// Scoring helpers
-function makeTodoScore() {
-  return { completeness: 0, correctness: 0, quality: 0, notes: [] };
-}
-function clamp(n, a, b) { return Math.max(a, Math.min(b, n)); }
-
-function pointsFrom(score) {
-  return clamp(score.completeness, 0, 8)
-    + clamp(score.correctness, 0, 4)
-    + clamp(score.quality, 0, 4);
-}
-
-// ----------- Endpoint checks (flexible) -----------
+// --------------------- checks ---------------------
 async function checkTodo1(base) {
   const s = makeTodoScore();
-  // Completeness: server responds to GET /
-  const res = await safeFetch(`${base}/`, FETCH_OPTS);
+  // Root responds?
+  const res = await safeFetch(`${base}/`);
   if (res) {
-    s.completeness = 8; // server is up
-    s.notes.push("Server responded on root path.");
-    // Correctness: status 200 is a good sign
-    if (res.status === 200) {
-      s.correctness = 4;
-      s.notes.push("Root returned 200 OK.");
-    } else {
-      s.notes.push(`Root returned status ${res.status}.`);
-    }
-    // Quality: JSON response (optional, lenient)
+    s.completeness = 8;
+    pushOK(s.notes, "Server responded on `/`.");
+    if (res.status === 200) { s.correctness = 4; pushOK(s.notes, "`/` returned 200."); }
+    else { pushWARN(s.notes, `\`/\` returned status ${res.status}.`); }
+
     try {
       await res.clone().json();
       s.quality = 4;
-      s.notes.push("Root returned JSON.");
+      pushOK(s.notes, "`/` returned JSON.");
     } catch {
-      s.notes.push("Root not JSON (quality points not granted).");
+      pushWARN(s.notes, "`/` did not return JSON.");
     }
   } else {
-    s.notes.push("No response from root path.");
+    pushX(s.notes, "No response from `/`.");
   }
   return s;
 }
 
 async function checkTodo2(base) {
   const s = makeTodoScore();
-  // Good request
-  const good = await safeFetch(`${base}/echo?name=Ali&age=22`, FETCH_OPTS);
-  if (good) {
-    s.completeness += 4; // route exists
+
+  // good case
+  const ok = await safeFetch(`${base}/echo?name=Ali&age=22`);
+  if (ok) {
+    s.completeness += 4;
+    if (ok.status === 200) { s.correctness += 2; pushOK(s.notes, "`/echo` success returned 200."); }
     try {
-      const j = await good.clone().json();
-      if (good.status === 200) s.correctness += 2;
+      const j = await ok.clone().json();
       if (j && j.ok === true && "name" in j && "age" in j && typeof j.msg === "string") {
-        s.quality += 2;
-        s.notes.push("Echo success: ok/name/age/msg present.");
+        s.quality += 2; pushOK(s.notes, "`/echo` success JSON has ok/name/age/msg.");
       } else {
-        s.notes.push("Echo success JSON shape is different (still acceptable).");
+        pushWARN(s.notes, "`/echo` success JSON shape differs (accepted).");
       }
-    } catch {
-      s.notes.push("Echo success did not return JSON.");
-    }
+    } catch { pushWARN(s.notes, "`/echo` success not JSON."); }
   } else {
-    s.notes.push("GET /echo not reachable.");
+    pushX(s.notes, "GET `/echo` not reachable.");
   }
 
-  // Missing param case
-  const bad = await safeFetch(`${base}/echo?name=Ali`, FETCH_OPTS);
+  // missing param case
+  const bad = await safeFetch(`${base}/echo?name=Ali`);
   if (bad) {
-    s.completeness += 4; // validation path exists
+    s.completeness += 4;
+    if (bad.status === 400) { s.correctness += 2; pushOK(s.notes, "`/echo` error returned 400."); }
     try {
       const j = await bad.clone().json();
-      if (bad.status === 400) s.correctness += 2;
       if (j && j.ok === false && typeof j.error === "string") {
-        s.quality += 2;
-        s.notes.push("Echo error: ok:false and error message present.");
+        s.quality += 2; pushOK(s.notes, "`/echo` error JSON has ok:false + error.");
       } else {
-        s.notes.push("Echo error JSON shape is different (still acceptable).");
+        pushWARN(s.notes, "`/echo` error JSON shape differs (accepted).");
       }
-    } catch {
-      s.notes.push("Echo error did not return JSON.");
-    }
+    } catch { pushWARN(s.notes, "`/echo` error not JSON."); }
   } else {
-    s.notes.push("GET /echo missing-param case not reachable.");
+    pushX(s.notes, "GET `/echo` missing-param case not reachable.");
   }
 
-  // cap by max per band
-  s.completeness = Math.min(s.completeness, 8);
-  s.correctness = Math.min(s.correctness, 4);
-  s.quality = Math.min(s.quality, 4);
+  s.completeness = Math.min(8, s.completeness);
+  s.correctness = Math.min(4, s.correctness);
+  s.quality = Math.min(4, s.quality);
   return s;
 }
 
 async function checkTodo3(base) {
   const s = makeTodoScore();
-  const res = await safeFetch(`${base}/profile/Jack/Black`, FETCH_OPTS);
+  const res = await safeFetch(`${base}/profile/Jack/Black`);
   if (res) {
-    s.completeness = 8; // route exists
+    s.completeness = 8; pushOK(s.notes, "`/profile/:first/:last` reachable.");
+    if (res.status === 200) { s.correctness = 4; pushOK(s.notes, "`/profile` returned 200."); }
     try {
       const j = await res.clone().json();
-      if (res.status === 200) s.correctness = 4;
       if (j && j.ok === true && typeof j.fullName === "string") {
-        s.quality = 4; // quality points for structured JSON
-        s.notes.push(`Profile returned fullName: ${j.fullName}`);
+        s.quality = 4; pushOK(s.notes, "`/profile` JSON contains ok:true and fullName.");
       } else {
-        s.notes.push("Profile JSON shape is different (still acceptable).");
+        pushWARN(s.notes, "`/profile` JSON shape differs (accepted).");
       }
-    } catch {
-      s.notes.push("Profile did not return JSON.");
-    }
+    } catch { pushWARN(s.notes, "`/profile` not JSON."); }
   } else {
-    s.notes.push("GET /profile/:first/:last not reachable.");
+    pushX(s.notes, "GET `/profile/:first/:last` not reachable.");
   }
   return s;
 }
 
 async function checkTodo4and5(base) {
-  // We infer app.param validator behavior via /users/:userId responses
-  const s4 = makeTodoScore(); // param middleware
-  const s5 = makeTodoScore(); // users route
+  const s4 = makeTodoScore();
+  const s5 = makeTodoScore();
 
-  // Valid id
-  const ok = await safeFetch(`${base}/users/42`, FETCH_OPTS);
-  if (ok) {
-    s5.completeness += 8; // route exists
+  // valid id
+  const good = await safeFetch(`${base}/users/42`);
+  if (good) {
+    s5.completeness += 8; pushOK(s5.notes, "`/users/:userId` reachable with valid id.");
+    if (good.status === 200) { s5.correctness += 4; pushOK(s5.notes, "`/users` valid returned 200."); }
     try {
-      const j = await ok.clone().json();
-      if (ok.status === 200) s5.correctness += 4;
+      const j = await good.clone().json();
       if (j && j.ok === true && ("userId" in j)) {
-        s5.quality += 4;
-        s5.notes.push("Users success: ok:true and userId present.");
+        s5.quality += 4; pushOK(s5.notes, "`/users` success JSON contains ok:true and userId.");
       } else {
-        s5.notes.push("Users success JSON shape is different (still acceptable).");
+        pushWARN(s5.notes, "`/users` success JSON shape differs (accepted).");
       }
-    } catch {
-      s5.notes.push("Users success did not return JSON.");
-    }
+    } catch { pushWARN(s5.notes, "`/users` success not JSON."); }
   } else {
-    s5.notes.push("GET /users/:userId not reachable.");
+    pushX(s5.notes, "GET `/users/:userId` not reachable.");
   }
 
-  // Invalid id (string)
-  const bad1 = await safeFetch(`${base}/users/abc`, FETCH_OPTS);
+  // invalid: non-numeric
+  const bad1 = await safeFetch(`${base}/users/abc`);
   if (bad1) {
-    s4.completeness += 4; // validator exists
+    s4.completeness += 4;
+    if (bad1.status === 400) { s4.correctness += 2; pushOK(s4.notes, "Param middleware rejected non-numeric id with 400."); }
     try {
       const j = await bad1.clone().json();
-      if (bad1.status === 400) s4.correctness += 2;
       if (j && j.ok === false && typeof j.error === "string") {
-        s4.quality += 2;
-        s4.notes.push("Validator rejected non-numeric userId with 400.");
+        s4.quality += 2; pushOK(s4.notes, "Error JSON includes ok:false + error.");
       } else {
-        s4.notes.push("Validator error JSON shape is different (still acceptable).");
+        pushWARN(s4.notes, "Error JSON shape (non-numeric) differs (accepted).");
       }
-    } catch {
-      s4.notes.push("Validator (abc) did not return JSON.");
-    }
+    } catch { pushWARN(s4.notes, "Error (non-numeric) not JSON."); }
   } else {
-    s4.notes.push("GET /users/abc not reachable (validator not observed).");
+    pushX(s4.notes, "`/users/abc` path not reachable (param middleware not observed).");
   }
 
-  // Invalid id (negative)
-  const bad2 = await safeFetch(`${base}/users/-5`, FETCH_OPTS);
+  // invalid: negative
+  const bad2 = await safeFetch(`${base}/users/-5`);
   if (bad2) {
-    s4.completeness += 4; // validator handling of sign
+    s4.completeness += 4;
+    if (bad2.status === 400) { s4.correctness += 2; pushOK(s4.notes, "Param middleware rejected negative id with 400."); }
     try {
       const j = await bad2.clone().json();
-      if (bad2.status === 400) s4.correctness += 2;
       if (j && j.ok === false && typeof j.error === "string") {
-        s4.quality += 2;
-        s4.notes.push("Validator rejected negative userId with 400.");
+        s4.quality += 2; pushOK(s4.notes, "Error JSON includes ok:false + error (negative).");
       } else {
-        s4.notes.push("Validator error JSON shape (negative) is different (still acceptable).");
+        pushWARN(s4.notes, "Error JSON shape (negative) differs (accepted).");
       }
-    } catch {
-      s4.notes.push("Validator (negative) did not return JSON.");
-    }
+    } catch { pushWARN(s4.notes, "Error (negative) not JSON."); }
   } else {
-    s4.notes.push("GET /users/-5 not reachable (validator not observed).");
+    pushX(s4.notes, "`/users/-5` path not reachable (param middleware not observed).");
   }
 
-  // cap bands
-  s4.completeness = Math.min(s4.completeness, 8);
-  s4.correctness = Math.min(s4.correctness, 4);
-  s4.quality = Math.min(s4.quality, 4);
-
-  s5.completeness = Math.min(s5.completeness, 8);
-  s5.correctness = Math.min(s5.correctness, 4);
-  s5.quality = Math.min(s5.quality, 4);
+  s4.completeness = Math.min(8, s4.completeness);
+  s4.correctness = Math.min(4, s4.correctness);
+  s4.quality = Math.min(4, s4.quality);
+  s5.completeness = Math.min(8, s5.completeness);
+  s5.correctness = Math.min(4, s5.correctness);
+  s5.quality = Math.min(4, s5.quality);
 
   return { s4, s5 };
 }
 
-// -------------------- Main --------------------
+// --------------------- main ---------------------
 (async () => {
   const startInfo = await startStudentApp();
-  console.log(`Attempted to start: ${startInfo.usedCommand}`);
+  const usedCmd = startInfo.usedCommand;
+  const baseUrl = await findBaseUrl(startInfo.detectedPort);
 
-  const baseUrl = await findWorkingBaseUrl(startInfo.detectedPort);
-  if (!baseUrl) {
-    console.error("Could not detect a running server on localhost common ports.");
-  } else {
-    console.log(`Detected base URL: ${baseUrl}`);
-  }
-
-  const feedback = [];
-  let totalLabPoints = 0;
-
-  let todo1 = makeTodoScore();
-  let todo2 = makeTodoScore();
-  let todo3 = makeTodoScore();
-  let todo4 = makeTodoScore();
-  let todo5 = makeTodoScore();
+  // scoring
+  let t1 = makeTodoScore();
+  let t2 = makeTodoScore();
+  let t3 = makeTodoScore();
+  let t4 = makeTodoScore();
+  let t5 = makeTodoScore();
 
   if (baseUrl) {
-    todo1 = await checkTodo1(baseUrl);
-    todo2 = await checkTodo2(baseUrl);
-    todo3 = await checkTodo3(baseUrl);
-    const { s4, s5 } = await checkTodo4and5(baseUrl);
-    todo4 = s4;
-    todo5 = s5;
+    t1 = await checkTodo1(baseUrl);
+    t2 = await checkTodo2(baseUrl);
+    t3 = await checkTodo3(baseUrl);
+    const r = await checkTodo4and5(baseUrl);
+    t4 = r.s4;
+    t5 = r.s5;
   } else {
-    // No server: leave everything at zero but with notes
-    todo1.notes.push("Server not reachable; cannot run endpoint checks.");
-    todo2.notes.push("Server not reachable.");
-    todo3.notes.push("Server not reachable.");
-    todo4.notes.push("Server not reachable.");
-    todo5.notes.push("Server not reachable.");
+    t1.notes.push("Server not reachable; cannot run endpoint checks.");
+    t2.notes.push("Server not reachable.");
+    t3.notes.push("Server not reachable.");
+    t4.notes.push("Server not reachable.");
+    t5.notes.push("Server not reachable.");
   }
 
-  const p1 = pointsFrom(todo1);
-  const p2 = pointsFrom(todo2);
-  const p3 = pointsFrom(todo3);
-  const p4 = pointsFrom(todo4);
-  const p5 = pointsFrom(todo5);
+  const p1 = bandPoints(t1);
+  const p2 = bandPoints(t2);
+  const p3 = bandPoints(t3);
+  const p4 = bandPoints(t4);
+  const p5 = bandPoints(t5);
 
-  totalLabPoints = p1 + p2 + p3 + p4 + p5;
+  let labPoints = p1 + p2 + p3 + p4 + p5;
+  const someProgress = [p1, p2, p3, p4, p5].some(x => x > 0);
+  if (someProgress && labPoints < 60) labPoints = 60;
 
-  // If there is some progress but < 60/80, floor to 60
-  const someProgress = [p1, p2, p3, p4, p5].some((x) => x > 0);
-  if (someProgress && totalLabPoints < 60) {
-    totalLabPoints = 60;
-  }
+  const subPoints = isLate ? (isLate() ? 10 : 20) : 20; // guard if moved
+  const totalPoints = labPoints + subPoints;
 
-  // Submission timing points
-  const submissionPoints = isLate() ? 10 : 20;
-
-  const totalPoints = totalLabPoints + submissionPoints;
-
-  // Build human-readable feedback per TODO
-  function summarizeTodo(name, s, pts) {
-    const missed = [];
-    if (s.completeness < 8) missed.push("completeness");
-    if (s.correctness < 4) missed.push("correctness");
-    if (s.quality < 4) missed.push("quality");
-    return {
-      name,
-      points: pts,
-      breakdown: { completeness: s.completeness, correctness: s.correctness, quality: s.quality },
-      implemented: s.notes.filter((n) => n.toLowerCase().includes("returned") || n.toLowerCase().includes("respond")),
-      missed: missed.length ? missed : ["None"],
-      notes: s.notes,
-    };
+  function sectionFor(name, s, pts) {
+    const lines = [];
+    lines.push(`## ${name} — ${pts}/16`);
+    lines.push(`Completeness: ${Math.min(8, s.completeness)}/8, Correctness: ${Math.min(4, s.correctness)}/4, Quality: ${Math.min(4, s.quality)}/4`);
+    if (s.notes.length) {
+      for (const n of s.notes) lines.push(n);
+    } else {
+      lines.push("—");
+    }
+    lines.push(""); return lines.join("\n");
   }
 
   const report = {
     meta: {
       graded_at_utc: nowUtcIso(),
-      deadline_local: DUE_STR,
+      deadline_riyadh: DUE_STR,
       is_late: isLate(),
-      base_url: baseUrl || null,
-      command_used: startInfo.usedCommand,
+      repo_root: REPO_ROOT,
+      lab_dir: LAB_DIR,
+      command_used: usedCmd,
+      detected_base_url: baseUrl || null,
     },
     scoring: {
-      todo_points: {
-        TODO_1: p1,
-        TODO_2: p2,
-        TODO_3: p3,
-        TODO_4: p4,
-        TODO_5: p5,
-      },
-      lab_points: totalLabPoints,
-      submission_points: submissionPoints,
+      per_todo: { TODO_1: p1, TODO_2: p2, TODO_3: p3, TODO_4: p4, TODO_5: p5 },
+      lab_points: labPoints,
+      submission_points: subPoints,
       total_points: totalPoints,
-      rubric: "Each TODO = 16 (8 completeness, 4 correctness, 4 quality). Lab total 80 + submission 20.",
     },
-    feedback: [
-      summarizeTodo("TODO-1 (Server Setup)", todo1, p1),
-      summarizeTodo("TODO-2 (/echo route)", todo2, p2),
-      summarizeTodo("TODO-3 (/profile route)", todo3, p3),
-      summarizeTodo("TODO-4 (param middleware)", todo4, p4),
-      summarizeTodo("TODO-5 (/users/:userId)", todo5, p5),
-    ],
   };
 
-  // Write artifacts
-  const jsonPath = path.join(OUT_DIR, "grade.json");
-  const txtPath = path.join(OUT_DIR, "grade.txt");
+  // ----- human summary (sample-like) -----
+  const summary = [];
+  summary.push("==== 6-3 Express Request Data — Grade Summary ====");
+  summary.push(`Graded at (UTC): ${report.meta.graded_at_utc}`);
+  summary.push(`Deadline (Riyadh): ${report.meta.deadline_riyadh}`);
+  summary.push(`Late submission? ${report.meta.is_late ? "Yes (10/20)" : "No (20/20)"}`);
+  summary.push(`Detected base URL: ${report.meta.detected_base_url || "N/A"}`);
+  summary.push("");
+  summary.push("Per-TODO Points:");
+  summary.push(`- TODO_1: ${p1}/16`);
+  summary.push(`- TODO_2: ${p2}/16`);
+  summary.push(`- TODO_3: ${p3}/16`);
+  summary.push(`- TODO_4: ${p4}/16`);
+  summary.push(`- TODO_5: ${p5}/16`);
+  summary.push("");
+  summary.push(`Lab Points: ${labPoints}/80`);
+  summary.push(`Submission Points: ${subPoints}/20`);
+  summary.push(`TOTAL: ${totalPoints}/100`);
+  summary.push("");
+  summary.push("Per-TODO Feedback (what you implemented vs. what's missing)");
+  summary.push(sectionFor("TODO 1: Server Setup (`/`)", t1, p1));
+  summary.push(sectionFor("TODO 2: `/echo` route", t2, p2));
+  summary.push(sectionFor("TODO 3: `/profile/:first/:last`", t3, p3));
+  summary.push(sectionFor("TODO 4: `app.param('userId', ...)`", t4, p4));
+  summary.push(sectionFor("TODO 5: `/users/:userId`", t5, p5));
 
-  fs.writeFileSync(jsonPath, JSON.stringify(report, null, 2), "utf-8");
+  const gradeTxt = summary.join("\n");
+  const gradeJsonPath = path.join(OUT_DIR, "grade.json");
+  const gradeTxtPath = path.join(OUT_DIR, "grade.txt");
 
-  const lines = [];
-  lines.push("==== 6-3 Express Request Data — Grade Summary ====");
-  lines.push(`Graded at (UTC): ${report.meta.graded_at_utc}`);
-  lines.push(`Deadline (Riyadh): ${report.meta.deadline_local}`);
-  lines.push(`Late submission? ${report.meta.is_late ? "Yes (10/20)" : "No (20/20)"}`);
-  lines.push(`Detected base URL: ${report.meta.base_url || "N/A"}`);
-  lines.push("");
-  lines.push("Per-TODO Points:");
-  for (const [k, v] of Object.entries(report.scoring.todo_points)) {
-    lines.push(`- ${k}: ${v}/16`);
-  }
-  lines.push("");
-  lines.push(`Lab Points: ${report.scoring.lab_points}/80`);
-  lines.push(`Submission Points: ${report.scoring.submission_points}/20`);
-  lines.push(`TOTAL: ${report.scoring.total_points}/100`);
-  lines.push("");
-  lines.push("Feedback Summary (what was implemented / missed):");
-  for (const item of report.feedback) {
-    lines.push(`\n## ${item.name} — ${item.points}/16`);
-    lines.push(`Breakdown: completeness=${item.breakdown.completeness}, correctness=${item.breakdown.correctness}, quality=${item.breakdown.quality}`);
-    lines.push("- Implemented:");
-    if (item.implemented.length) {
-      for (const note of item.implemented) lines.push(`  • ${note}`);
-    } else {
-      lines.push("  • (no implemented notes captured)");
+  fs.writeFileSync(gradeJsonPath, JSON.stringify(report, null, 2), "utf-8");
+  fs.writeFileSync(gradeTxtPath, gradeTxt, "utf-8");
+
+  // Print to logs
+  console.log(gradeTxt);
+
+  // Publish to Actions Job Summary
+  try {
+    const sumPath = process.env.GITHUB_STEP_SUMMARY;
+    if (sumPath) {
+      const md = [
+        "## 6-3 Express Request Data — Grade Summary",
+        "",
+        "```txt",
+        gradeTxt,
+        "```",
+        "",
+        "**Lab dir:** " + report.meta.lab_dir,
+        "",
+      ].join("\n");
+      fs.appendFileSync(sumPath, md, "utf-8");
     }
-    lines.push("- Missed:");
-    for (const m of item.missed) lines.push(`  • ${m}`);
-  }
+  } catch {}
 
-  fs.writeFileSync(txtPath, lines.join("\n"), "utf-8");
-
-  // Print short summary to Actions logs
-  console.log(lines.join("\n"));
-
-  // Ensure process ends; kill child if still running
+  // Cleanup spawned process
   try {
     if (startInfo.child && startInfo.child.pid) {
       if (process.platform === "win32") {
         spawn("taskkill", ["/pid", String(startInfo.child.pid), "/f", "/t"]);
       } else {
-        process.kill(-startInfo.child.pid, "SIGKILL");
-        process.kill(startInfo.child.pid, "SIGKILL");
+        try { process.kill(-startInfo.child.pid, "SIGKILL"); } catch {}
+        try { process.kill(startInfo.child.pid, "SIGKILL"); } catch {}
       }
     }
-  } catch (e) {
-    // ignore
-  }
-})().catch((e) => {
+  } catch {}
+
+})().catch(e => {
   console.error("Grader crashed:", e);
   process.exitCode = 1;
 });

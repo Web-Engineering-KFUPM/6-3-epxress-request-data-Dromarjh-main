@@ -3,13 +3,13 @@ name: Grade 6-3 Express Request Data
 on:
   workflow_dispatch:
   push:
-    branches:
-      - "**"
+    branches: ["**"]
   pull_request:
 
 jobs:
   grade:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
 
     steps:
       - name: Checkout repo
@@ -20,38 +20,65 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Install dependencies (if any)
+      # Install deps INSIDE the lab folder
+      - name: Install dependencies (lab folder)
+        working-directory: 6-3-express-request-data
         run: |
           if [ -f package.json ]; then
-            npm ci || npm install
+            npm ci --no-audit --no-fund || npm install --no-audit --no-fund
           fi
 
       - name: Debug paths
         run: |
-          echo "PWD:"
-          pwd
-          echo "Root list:"
-          ls -la
-          echo "----"
-          echo "List lab folder:"
-          ls -la "6-3-express-request-data" || true
-          echo "----"
-          echo "List script folder:"
-          ls -la "6-3-express-request-data/script" || true
-          echo "Grader present?"
-          test -f "6-3-express-request-data/script/grade.cjs" && echo "YES" || (echo "NO"; exit 1)
+          echo "PWD:"; pwd
+          echo "Root list:"; ls -la
+          echo "---- lab ----"; ls -la "6-3-express-request-data" || true
+          echo "---- script ----"; ls -la "6-3-express-request-data/script" || true
+          test -f "6-3-express-request-data/script/grade.cjs" && echo "grader OK" || (echo "grader missing"; exit 1)
 
-      - name: Run grader
+      # Kill any stray node (defensive)
+      - name: Pre-clean Node processes
+        if: always()
         run: |
-          node "6-3-express-request-data/script/grade.cjs"
+          pkill -f "node .*server\.js" || true
+          pkill -f "node .*grade\.cjs" || true
+          pkill -x node || true
+
+      # Run the grader FROM the lab folder so process.cwd() is correct
+      - name: Run grader (with timeout)
+        working-directory: 6-3-express-request-data
         env:
           NODE_ENV: test
+        run: |
+          timeout 90s node "script/grade.cjs" || echo "::warning::Grader timed out or exited non-zero."
+        continue-on-error: true
 
+      # Show the feedback summary in Actions "Summary" tab
+      - name: Publish grading summary
+        if: always()
+        run: |
+          echo "## 6-3 Express Request Data — Grade Summary" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "6-3-express-request-data/dist/grading/grade.txt" ]; then
+            echo '```txt' >> "$GITHUB_STEP_SUMMARY"
+            cat "6-3-express-request-data/dist/grading/grade.txt" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "_No grade.txt found. The grader may have timed out or failed before writing artifacts._" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # Upload artifacts from the lab folder
       - name: Upload grading artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: grading-results
           path: |
-            dist/grading/grade.json
-            dist/grading/grade.txt
+            6-3-express-request-data/dist/grading/grade.json
+            6-3-express-request-data/dist/grading/grade.txt
           if-no-files-found: warn
+
+      # Final cleanup
+      - name: Post-clean Node processes
+        if: always()
+        run: |
+          pkill -x node || true
