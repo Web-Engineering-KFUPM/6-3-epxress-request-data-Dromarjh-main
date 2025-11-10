@@ -1,0 +1,42 @@
+name: Grade 6-3 Express Request Data
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+jobs:
+  grade:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies (if any)
+        run: |
+          if [ -f package.json ]; then
+            npm ci || npm install
+          fi
+
+      - name: Run grader
+        run: |
+          node ./6-3-express-request-data/script/grade.cjs
+        env:
+          NODE_ENV: test
+
+      - name: Upload grading artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: grading-results
+          path: |
+            dist/grading/grade.json
+            dist/grading/grade.txt
+          if-no-files-found: warn
