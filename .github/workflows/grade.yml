@@ -3,14 +3,12 @@ name: Grade 6-3 Express Request Data
 on:
   workflow_dispatch:
   push:
-    branches:
-      - "**"
+    branches: ["**"]
   pull_request:
 
 jobs:
   grade:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -20,42 +18,51 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Install dependencies (if any)
+      # Install deps INSIDE the lab folder
+      - name: Install dependencies (lab folder)
+        working-directory: 6-3-express-request-data
         run: |
           if [ -f package.json ]; then
             npm ci || npm install
           fi
 
+      # (optional) quick debug
       - name: Debug paths
         run: |
-          echo "PWD:"
           pwd
-          echo "Root list:"
           ls -la
-          echo "----"
-          echo "List lab folder:"
-          ls -la "6-3-express-request-data" || true
-          echo "----"
-          echo "List script folder:"
-          ls -la "6-3-express-request-data/script" || true
-          echo "Grader present?"
-          test -f "6-3-express-request-data/script/grade.cjs" && echo "YES" || (echo "NO"; exit 1)
+          echo "---- lab ----"
+          ls -la "6-3-express-request-data"
+          echo "---- script ----"
+          ls -la "6-3-express-request-data/script"
+          test -f "6-3-express-request-data/script/grade.cjs" && echo "grader OK"
 
+      # Run the grader FROM the lab folder so it can find server.js / npm start
       - name: Run grader
-        run: |
-          node "6-3-express-request-data/script/grade.cjs"
+        working-directory: 6-3-express-request-data
         env:
           NODE_ENV: test
+        run: |
+          node "script/grade.cjs"
 
-      # NEW: publish the feedback into the Actions Summary tab
+      # Publish the feedback to the Actions Summary tab
       - name: Publish grading summary
         if: always()
         run: |
           echo "## 6-3 Express Request Data — Grade Summary" >> "$GITHUB_STEP_SUMMARY"
-          if [ -f "dist/grading/grade.txt" ]; then
+          if [ -f "6-3-express-request-data/dist/grading/grade.txt" ]; then
             echo '```txt' >> "$GITHUB_STEP_SUMMARY"
-            cat "dist/grading/grade.txt" >> "$GITHUB_STEP_SUMMARY"
+            cat "6-3-express-request-data/dist/grading/grade.txt" >> "$GITHUB_STEP_SUMMARY"
             echo '```' >> "$GITHUB_STEP_SUMMARY"
           else
             echo "_No grade.txt found._" >> "$GITHUB_STEP_SUMMARY"
           fi
+
+      - name: Upload grading artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: grading-results
+          path: |
+            6-3-express-request-data/dist/grading/grade.json
+            6-3-express-request-data/dist/grading/grade.txt
+          if-no-files-found: warn
