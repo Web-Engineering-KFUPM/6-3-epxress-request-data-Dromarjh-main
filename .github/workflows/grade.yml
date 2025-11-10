@@ -47,11 +47,15 @@ jobs:
         env:
           NODE_ENV: test
 
-      - name: Upload grading artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: grading-results
-          path: |
-            dist/grading/grade.json
-            dist/grading/grade.txt
-          if-no-files-found: warn
+      # NEW: publish the feedback into the Actions Summary tab
+      - name: Publish grading summary
+        if: always()
+        run: |
+          echo "## 6-3 Express Request Data — Grade Summary" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "dist/grading/grade.txt" ]; then
+            echo '```txt' >> "$GITHUB_STEP_SUMMARY"
+            cat "dist/grading/grade.txt" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "_No grade.txt found._" >> "$GITHUB_STEP_SUMMARY"
+          fi
