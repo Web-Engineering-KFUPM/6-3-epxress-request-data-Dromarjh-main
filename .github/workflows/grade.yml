@@ -26,9 +26,24 @@ jobs:
             npm ci || npm install
           fi
 
+      - name: Debug paths
+        run: |
+          echo "PWD:"
+          pwd
+          echo "Root list:"
+          ls -la
+          echo "----"
+          echo "List lab folder:"
+          ls -la "6-3-express-request-data" || true
+          echo "----"
+          echo "List script folder:"
+          ls -la "6-3-express-request-data/script" || true
+          echo "Grader present?"
+          test -f "6-3-express-request-data/script/grade.cjs" && echo "YES" || (echo "NO"; exit 1)
+
       - name: Run grader
         run: |
-          node ./6-3-express-request-data/script/grade.cjs
+          node "6-3-express-request-data/script/grade.cjs"
         env:
           NODE_ENV: test
 
