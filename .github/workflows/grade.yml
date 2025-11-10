@@ -60,8 +60,6 @@ jobs:
           echo "## 6-3 Express Request Data — Grade Summary" >> "$GITHUB_STEP_SUMMARY"
           if [ -f "6-3-express-request-data/dist/grading/grade.txt" ]; then
             echo '```txt' >> "$GITHUB_STEP_SUMMARY"
-            cat "6-3-express-request-data/dist/grading/grade.txt" >> "$GITHUB_STEP_SUMMARY"
-            echo '```' >> "$GITHUB_STEP_SUMMARY"
           else
             echo "_No grade.txt found. The grader may have timed out or failed before writing artifacts._" >> "$GITHUB_STEP_SUMMARY"
           fi
