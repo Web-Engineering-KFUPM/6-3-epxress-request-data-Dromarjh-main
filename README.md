@@ -6,8 +6,7 @@ In this lab you will practice reading **request data** in Express: query‑strin
 > **Note:** Follow `server.js` to implement the lab. The file contains TODO blocks that describe exactly what to build.
 
 ## Reading Assignment
-- **6.5 Express request data** — zyBooks SWE363 (Fall 2025):  
-  https://learn.zybooks.com/zybook/SWE363Fall2025/chapter/6/section/5
+- 6.5 Express request data
 
 ## Concepts Used in this lab
 Below are the concepts and their code syntax patterns.
